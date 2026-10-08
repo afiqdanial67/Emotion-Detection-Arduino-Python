@@ -1,0 +1,214 @@
+import sys
+import time
+import serial
+import cv2
+import numpy as np
+from collections import Counter
+
+# ------------------------------------------
+# 1. TETAPAN ARDUINO
+# ------------------------------------------
+arduino_port = 'COM3'  # Tukar port jika berbeza
+baud_rate = 9600
+
+try:
+    arduino = serial.Serial(arduino_port, baud_rate, timeout=1)
+    time.sleep(2)
+    print(f"[BERJAYA] Disambung ke Arduino di port {arduino_port}")
+except Exception as e:
+    print(f"[RALAT] Gagal sambung ke Arduino: {e}")
+    arduino = None
+
+# Load Classifiers Asas Muka, Mata & Senyuman
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
+smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
+
+cap = cv2.VideoCapture(0)
+
+print("\n" + "="*50)
+print(" SISTEM IMBASAN 10 SAAT (TIRED: MATA TERTUTUP / MENGANTUK)")
+print(" - Push Button : Start / Stop Imbasan Kamera")
+print(" - Happy       : Senyum di depan kamera")
+print(" - Normal      : Muka biasa / Neutral")
+print(" - Sad         : Tunduk kepala ke bawah")
+print(" - Angry       : Pergerakan tangan/badan agresif")
+print(" - Tired       : Pejam mata / kelihatan mengantuk")
+print("="*50 + "\n")
+
+# Pembolehubah untuk Control Kamera Active/Inactive via Push Button
+camera_active = False  # False = Tidak scan sehinggalah butang ditekan
+
+# Pembolehubah untuk Mod 10 Saat & Interaksi Arduino
+SCAN_DURATION = 10.0  # Tempoh imbasan dalam saat
+scanning_active = True
+scan_start_time = time.time()
+detected_emotions_in_window = []
+
+waiting_for_arduino = False 
+wait_start_time = 0
+song_duration_limit = 35.0  # Masa perlindungan auto-reset jika Arduino senyap
+
+previous_frame_gray = None
+
+while True:
+    current_time = time.time()
+
+    # 1. SEMAK ISYARAT SERIAL DARI ARDUINO
+    if arduino and arduino.in_waiting > 0:
+        incoming_msg = arduino.readline().decode('utf-8').strip()
+        
+        # Push Button ditekan
+        if incoming_msg == "TOGGLE_CAM":
+            camera_active = not camera_active
+            print(f"[BUTTON] Status Kamera: {'ON (START)' if camera_active else 'OFF (STOP)'}")
+            
+            if camera_active:
+                scanning_active = True
+                scan_start_time = time.time()
+                detected_emotions_in_window.clear()
+        
+        # Signal DONE dari Arduino
+        elif incoming_msg == "DONE":
+            waiting_for_arduino = False
+            scanning_active = True
+            scan_start_time = time.time()
+            detected_emotions_in_window.clear()
+            print("[STATUS] Arduino kembali ke Standby. Mula imbasan baru 10 saat!")
+
+    # 2. JIKA KAMERA DITUTUP / INACTIVE (OFF)
+    if not camera_active:
+        blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        cv2.putText(blank_frame, "CAMERA OFF / STOPPED", (130, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(blank_frame, "Tekan Push Button Untuk Start", (110, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        cv2.imshow("Smile & Gesture Detector", blank_frame)
+        
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+        continue
+
+    # 3. JIKA KAMERA AKTIF (ON) - LAKUKAN PROSES IMBASAN
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame = cv2.flip(frame, 1)
+    height, width, _ = frame.shape
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if waiting_for_arduino and (current_time - wait_start_time > song_duration_limit):
+        waiting_for_arduino = False
+        scanning_active = True
+        scan_start_time = time.time()
+        detected_emotions_in_window.clear()
+        print("[AMARAN] Timeout. Imbasan 10 saat dimulakan semula.")
+
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80))
+    
+    current_frame_state = "NORMAL"
+    face_y_pos = 0
+    is_tired_eyes = False
+    is_smiling = False
+
+    if len(faces) > 0:
+        (x, y, w, h) = faces[0]
+        face_y_pos = y
+        
+        cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        
+        roi_gray = gray[y:y+h, x:x+w]
+        
+        # 1. Semak Senyuman (Happy)
+        smiles = smile_cascade.detectMultiScale(roi_gray, scaleFactor=1.8, minNeighbors=20, minSize=(25, 25))
+        if len(smiles) > 0:
+            is_smiling = True
+
+        # 2. TIRED: Mengesan mata tertutup/mengantuk
+        eyes = eye_cascade.detectMultiScale(roi_gray, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
+        if len(eyes) == 0 and face_y_pos <= (height * 0.55):
+            is_tired_eyes = True
+
+    # 3. Kesan Pergerakan Badan / Tangan (Angry)
+    if previous_frame_gray is None:
+        previous_frame_gray = gray
+        continue
+
+    frame_diff = cv2.absdiff(previous_frame_gray, gray)
+    _, thresh_diff = cv2.threshold(frame_diff, 25, 255, cv2.THRESH_BINARY)
+    motion_score = np.sum(thresh_diff) / 255.0
+    previous_frame_gray = gray.copy()
+
+    # 4. Logik Penentuan Status untuk Frame Semasa
+    if motion_score > 35000:
+        current_frame_state = "ANGRY"
+    elif len(faces) == 0 or face_y_pos > (height * 0.55):
+        current_frame_state = "SAD"
+    elif is_tired_eyes:
+        current_frame_state = "TIRED"
+    elif is_smiling:
+        current_frame_state = "HAPPY"
+    else:
+        current_frame_state = "NORMAL"
+
+    display_text = ""
+    text_color = (0, 255, 255)
+
+    if waiting_for_arduino:
+        display_text = "STATE: WAITING ARDUINO..."
+        text_color = (0, 0, 255)
+    elif scanning_active:
+        elapsed_time = current_time - scan_start_time
+        remaining_time = max(0.0, SCAN_DURATION - elapsed_time)
+        
+        detected_emotions_in_window.append(current_frame_state)
+        
+        display_text = f"SCANNING... {remaining_time:.1f}s"
+        text_color = (255, 255, 0)
+
+        if elapsed_time >= SCAN_DURATION:
+            if len(detected_emotions_in_window) > 0:
+                counts = Counter(detected_emotions_in_window)
+                final_emotion = counts.most_common(1)[0][0]
+                
+                if final_emotion == "NORMAL" and len(counts) > 1:
+                    for emo, count in counts.most_common():
+                        if emo != "NORMAL":
+                            final_emotion = emo
+                            break
+
+                print(f"[FINAL EMOSI SELEPAS 10 SAAT]: {final_emotion}")
+
+                command_map = {'SAD': '1', 'HAPPY': '2', 'ANGRY': '3', 'TIRED': '4'}
+                
+                if final_emotion != "NORMAL":
+                    command = command_map.get(final_emotion, '0')
+                    if command != '0':
+                        if arduino:
+                            arduino.write(command.encode())
+                            print(f"[HANTAR KE ARDUINO] Arahan '{command}' untuk '{final_emotion}'")
+                        else:
+                            print(f"[SIMULASI HANTAR] Arahan '{command}' untuk '{final_emotion}'")
+                    
+                    waiting_for_arduino = True
+                    wait_start_time = time.time()
+                else:
+                    print("[INFO] Keputusan 10 saat adalah Normal. Mengimbas semula...")
+
+            scanning_active = False
+            detected_emotions_in_window.clear()
+
+    cv2.putText(frame, display_text, (30, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, text_color, 2)
+
+    cv2.imshow("Smile & Gesture Detector", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+if arduino:
+    arduino.close()
