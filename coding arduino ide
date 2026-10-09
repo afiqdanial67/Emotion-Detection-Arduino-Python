@@ -1,0 +1,424 @@
+#include <Wire.h> 
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
+#include <avr/pgmspace.h> // Library untuk Flash Memory (jimat RAM)
+
+// Pin Mapping
+const int BUZZER_PIN = 8;
+const int LED_PIN    = 13;
+const int BUTTON_PIN = 2;   // Pin untuk Push Button Start/Stop Kamera
+const int DHT_PIN    = 4;   // Pin Signal untuk DHT11
+
+// Tetapan DHT11
+#define DHTTYPE DHT11
+DHT dht(DHT_PIN, DHTTYPE);
+
+// Debouncing Push Button
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+// Pitch Definitions (Mice on Venus)
+#define REST     0
+#define NOTE_B3  247
+#define NOTE_C4  262
+#define NOTE_CS4 277
+#define NOTE_D4  294
+#define NOTE_DS4 311
+#define NOTE_E4  330
+#define NOTE_F4  349
+#define NOTE_FS4 370
+#define NOTE_G4  392
+#define NOTE_GS4 415
+#define NOTE_A4  440
+#define NOTE_AS4 466
+#define NOTE_B4  494
+#define NOTE_C5  523
+#define NOTE_CS5 554
+#define NOTE_D5  587
+#define NOTE_DS5 622
+#define NOTE_E5  659
+#define NOTE_F5  698
+#define NOTE_FS5 740
+#define NOTE_G5  784
+#define NOTE_GS5 831
+#define NOTE_A5  880
+#define NOTE_AS5 932
+#define NOTE_B5  988
+
+// Array Melodi & Durasi disimpan dalam PROGMEM (Flash Memory) untuk mengelakkan ralat RAM
+const int melody[] PROGMEM = {
+  REST,
+  NOTE_E4, NOTE_DS4, NOTE_B3, NOTE_E4, NOTE_DS4, NOTE_B3,
+  NOTE_E4, NOTE_DS4, NOTE_B3, NOTE_E4, NOTE_FS4, NOTE_GS4,
+  NOTE_B4, NOTE_CS5, NOTE_E5, NOTE_A5, NOTE_GS5, NOTE_FS5,
+  NOTE_D5, NOTE_D5, NOTE_E5, NOTE_FS5, NOTE_E5,
+  NOTE_B4, NOTE_GS4, NOTE_A5, NOTE_B4,
+  NOTE_DS5, NOTE_E5,
+  NOTE_B4, NOTE_CS5, NOTE_E5, NOTE_A5, NOTE_GS5,
+  NOTE_DS5,
+  NOTE_B5, NOTE_A5, NOTE_GS5,
+  NOTE_E5, NOTE_E5, NOTE_E5, NOTE_FS5, NOTE_FS5, NOTE_FS5,
+  NOTE_GS5, NOTE_GS5, NOTE_GS5, NOTE_DS5, NOTE_DS5, NOTE_DS5,
+  NOTE_CS5, NOTE_E4, NOTE_CS5, NOTE_B4,
+  NOTE_CS5, NOTE_B4, NOTE_GS4, NOTE_A4,
+  NOTE_B4, NOTE_A4, NOTE_GS4, NOTE_E4,
+  NOTE_E4
+};
+
+const byte durations[] PROGMEM = {
+  4,
+  4, 4, 4, 4, 4, 4,
+  4, 4, 4, 4, 4, 4,
+  4, 4, 4, 4, 4, 4,
+  2, 4, 4, 4, 4,
+  2, 4, 4, 4,
+  2, 2,
+  4, 4, 4, 4, 4,
+  2,
+  4, 4, 4,
+  4, 4, 4, 4, 4, 4,
+  4, 4, 4, 4, 4, 4,
+  2, 4, 2, 4,
+  2, 2, 4, 4,
+  2, 2, 4, 4,
+  1
+};
+
+int totalNotes = sizeof(durations) / sizeof(durations[0]);
+int noteIndex = 0;
+bool isPlayingNote = false;
+unsigned long noteStartTime = 0;
+int currentNoteDuration = 0;
+
+// LCD Initialization (I2C Address 0x27)
+LiquidCrystal_I2C lcd(0x27, 16, 4);
+
+int currentEmotion = 0; // 0: Standby, 1: Sad, 2: Happy, 3: Angry, 4: Tired
+int currentSegment = 0; 
+
+unsigned long previousMillis = 0;
+const long segmentDuration = 3500; // 3.5 saat setiap segmen emosi
+
+// Auto Scroll Standby (DHT vs Camera Status)
+unsigned long standbyMillis = 0;
+const long standbyInterval = 3000; // Tukar paparan setiap 3 saat semasa Standby
+int standbyState = 0; 
+
+void setup() {
+  Serial.begin(9600); // Mesti 9600 mengikut baud_rate Python
+  
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+  
+  displayStandby(0);
+}
+
+void loop() {
+  // 1. SEMAK TEKANAN PUSH BUTTON
+  checkPushButton();
+
+  // 2. Terima input dari Serial (Python Camera)
+  if (currentEmotion == 0 && Serial.available() > 0) {
+    char incomingChar = Serial.read();
+    
+    if (incomingChar == '1')      selectEmotion(1); // SAD
+    else if (incomingChar == '2') selectEmotion(2); // HAPPY
+    else if (incomingChar == '3') selectEmotion(3); // ANGRY
+    else if (incomingChar == '4') selectEmotion(4); // TIRED
+  }
+
+  // 3. AUTO-SCROLL PAPARAN STANDBY (Termasuk Suhu & Kelembapan)
+  if (currentEmotion == 0) {
+    unsigned long currentMillis = millis();
+    if (currentMillis - standbyMillis >= standbyInterval) {
+      standbyMillis = currentMillis;
+      standbyState = (standbyState + 1) % 2; 
+      displayStandby(standbyState);
+    }
+  }
+
+  // 4. Logik Program Emosi & Auto-Scroll Segmen
+  if (currentEmotion > 0) {
+    unsigned long currentMillis = millis();
+
+    bool isSongFinished = checkAndPlayMelody();
+
+    if (isSongFinished) {
+      resetToStandby();
+      return;
+    }
+
+    if (currentMillis - previousMillis >= segmentDuration) {
+      previousMillis = currentMillis;
+      
+      int startMotivasi = 0;
+      int maxSegment = 0;
+
+      if (currentEmotion == 1)      { startMotivasi = 4; maxSegment = 7; }
+      else if (currentEmotion == 2) { startMotivasi = 3; maxSegment = 6; }
+      else if (currentEmotion == 3) { startMotivasi = 3; maxSegment = 6; }
+      else if (currentEmotion == 4) { startMotivasi = 4; maxSegment = 7; }
+
+      currentSegment++;
+
+      if (currentSegment < startMotivasi) {
+        updateLCD();
+      } 
+      else if (currentSegment >= startMotivasi) {
+        if (currentSegment >= maxSegment) {
+          currentSegment = startMotivasi; 
+        }
+        updateLCD();
+      }
+    }
+  }
+}
+
+void checkPushButton() {
+  int reading = digitalRead(BUTTON_PIN);
+
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    static bool buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) {
+        // Hantar isyarat tepat ke Python untuk hidupkan/matikan imbasan
+        Serial.println(F("TOGGLE_CAM"));
+      }
+    }
+  }
+  lastButtonState = reading;
+}
+
+bool checkAndPlayMelody() {
+  bool isMotivationSegment = false;
+
+  if ((currentEmotion == 1 && currentSegment >= 4) ||
+      (currentEmotion == 2 && currentSegment >= 3) ||
+      (currentEmotion == 3 && currentSegment >= 3) ||
+      (currentEmotion == 4 && currentSegment >= 4)) {
+    isMotivationSegment = true;
+  }
+
+  if (isMotivationSegment) {
+    unsigned long currentMillis = millis();
+
+    if (!isPlayingNote) {
+      byte durationVal = pgm_read_byte(&(durations[noteIndex]));
+      currentNoteDuration = 1000 / durationVal;
+      noteStartTime = currentMillis;
+      isPlayingNote = true;
+
+      int noteVal = pgm_read_word(&(melody[noteIndex]));
+
+      if (noteVal == REST) {
+        noTone(BUZZER_PIN);
+      } else {
+        tone(BUZZER_PIN, noteVal);
+      }
+    }
+
+    int totalNoteTime = currentNoteDuration * 1.30;
+    if (currentMillis - noteStartTime >= totalNoteTime) {
+      noTone(BUZZER_PIN);
+      isPlayingNote = false;
+      noteIndex++;
+
+      if (noteIndex >= totalNotes) {
+        return true;
+      }
+    }
+  } else {
+    noTone(BUZZER_PIN);
+    noteIndex = 0;
+    isPlayingNote = false;
+  }
+
+  return false;
+}
+
+void selectEmotion(int emotion) {
+  digitalWrite(LED_PIN, HIGH);
+  tone(BUZZER_PIN, 1000, 100);
+  delay(100);
+  digitalWrite(LED_PIN, LOW);
+
+  currentEmotion = emotion;
+  currentSegment = 0;
+  noteIndex = 0;
+  isPlayingNote = false;
+  previousMillis = millis();
+  
+  updateLCD();
+}
+
+void resetToStandby() {
+  currentEmotion = 0;
+  currentSegment = 0;
+  noteIndex = 0;
+  isPlayingNote = false;
+  noTone(BUZZER_PIN);
+  standbyState = 0;
+  standbyMillis = millis();
+  displayStandby(0);
+
+  // Isyarat wajib untuk Python mengetahui paparan motivasi & lagu sudah tamat
+  Serial.println(F("DONE"));
+}
+
+void updateLCD() {
+  lcd.clear();
+
+  if (currentEmotion == 1) { // SAD
+    if (currentSegment == 0) { 
+      lcd.setCursor(0, 0); lcd.print(F("EMOTION: SAD")); 
+      lcd.setCursor(0, 1); lcd.print(F("At-Taubah 9:40")); 
+    } 
+    else if (currentSegment == 1) { 
+      lcd.setCursor(0, 0); lcd.print(F("Janganlah kamu")); 
+      lcd.setCursor(0, 1); lcd.print(F("berduka cita,"));
+    }
+    else if (currentSegment == 2) { 
+      lcd.setCursor(0, 0); lcd.print(F("sesungguhnya")); 
+      lcd.setCursor(0, 1); lcd.print(F("Allah ada"));
+    }
+    else if (currentSegment == 3) { 
+      lcd.setCursor(0, 0); lcd.print(F("bersama kita")); 
+    }
+    else if (currentSegment == 4) { 
+      lcd.setCursor(0, 0); lcd.print(F("=== MOTIVASI ===")); 
+      lcd.setCursor(0, 1); lcd.print(F(" Kata Semangat:"));
+    }
+    else if (currentSegment == 5) { 
+      lcd.setCursor(0, 0); lcd.print(F("Kesedihan ini")); 
+      lcd.setCursor(0, 1); lcd.print(F("hanya sementara."));
+    }
+    else if (currentSegment == 6) {
+      lcd.setCursor(0, 0); lcd.print(F("Senyumlah, kamu")); 
+      lcd.setCursor(0, 1); lcd.print(F("insan yang kuat!")); 
+    }
+  }
+  else if (currentEmotion == 2) { // HAPPY
+    if (currentSegment == 0) { 
+      lcd.setCursor(0, 0); lcd.print(F("EMOTION: HAPPY")); 
+      lcd.setCursor(0, 1); lcd.print(F("Ibrahim 14:7")); 
+    } 
+    else if (currentSegment == 1) { 
+      lcd.setCursor(0, 0); lcd.print(F("Jika kamu"));
+      lcd.setCursor(0, 1); lcd.print(F("bersyukur"));
+    }
+    else if (currentSegment == 2){
+      lcd.setCursor(0, 0); lcd.print(F("pasti Ku tambah"));
+    }
+    else if (currentSegment == 3){ 
+      lcd.setCursor(0, 0); lcd.print(F("nikmat-Ku kepadamu")); 
+      lcd.setCursor(0, 1); lcd.print(F("kepadamu"));
+    }
+    else if (currentSegment == 4) {
+      lcd.setCursor(0, 0); lcd.print(F("=== MOTIVASI ===")); 
+      lcd.setCursor(0, 1); lcd.print(F(" Kata Semangat:")); 
+    }
+    else if (currentSegment == 5) { 
+      lcd.setCursor(0, 0); lcd.print(F("Teruskan senyum!"));
+      lcd.setCursor(0, 1); lcd.print(F("Hari ni milikmu.")); 
+    }
+    else if (currentSegment == 6) { 
+      lcd.setCursor(0, 0); lcd.print(F("Kerianganmu"));
+      lcd.setCursor(0, 1); lcd.print(F("membawa berkat!"));
+    }
+  }
+  else if (currentEmotion == 3) { // ANGRY
+    if (currentSegment == 0) {
+      lcd.setCursor(0, 0); lcd.print(F("EMOTION: ANGRY")); 
+      lcd.setCursor(0, 1); lcd.print(F("Ali 'Imran 3:134"));
+    } 
+    else if (currentSegment == 1) {
+      lcd.setCursor(0, 0); lcd.print(F("Dan orang yang")); 
+      lcd.setCursor(0, 1); lcd.print(F("menahan marahnya"));
+    }
+    else if (currentSegment == 2) { 
+      lcd.setCursor(0, 0); lcd.print(F("serta memaafkan")); 
+      lcd.setCursor(0, 1); lcd.print(F("orang lain"));
+    }
+    else if (currentSegment == 3) { 
+      lcd.setCursor(0, 0); lcd.print(F("=== MOTIVASI ===")); 
+      lcd.setCursor(0, 1); lcd.print(F(" Kata Semangat:"));
+    }
+    else if (currentSegment == 4) {
+      lcd.setCursor(0, 0); lcd.print(F("Bertenanglah...")); 
+      lcd.setCursor(0, 1); lcd.print(F("Kawal emosimu."));
+    }
+    else if (currentSegment == 5) {
+      lcd.setCursor(0, 0); lcd.print(F("Kedamaian hati")); 
+      lcd.setCursor(0, 1); lcd.print(F("bermula darimu."));
+    }
+  }
+  else if (currentEmotion == 4) { // TIRED
+    if (currentSegment == 0) {
+      lcd.setCursor(0, 0); lcd.print(F("EMOTION: TIRED")); 
+      lcd.setCursor(0, 1); lcd.print(F("Ash-Syarh 94:5"));
+    } 
+    else if (currentSegment == 1) {
+      lcd.setCursor(0, 0); lcd.print(F("Maka bahawa"));
+      lcd.setCursor(0, 1); lcd.print(F("sesungguhnya"));
+    }
+    else if (currentSegment == 2) { 
+      lcd.setCursor(0, 0); lcd.print(F("tiap tiap")); 
+      lcd.setCursor(0, 1); lcd.print(F("kesukaran")); 
+    }
+    else if (currentSegment == 3) { 
+      lcd.setCursor(0, 0); lcd.print(F("disertai dengan")); 
+      lcd.setCursor(0, 1); lcd.print(F("kemudahan")); 
+    }
+    else if (currentSegment == 4) { 
+      lcd.setCursor(0, 0); lcd.print(F("=== MOTIVASI ===")); 
+      lcd.setCursor(0, 1); lcd.print(F(" Kata Semangat:"));
+    }
+    else if (currentSegment == 5) { 
+      lcd.setCursor(0, 0); lcd.print(F("rehat seketika")); 
+      lcd.setCursor(0, 1); lcd.print(F("Usahamu bernilai!"));
+    }
+    else if (currentSegment == 6) { 
+      lcd.setCursor(0, 0); lcd.print(F("Bangkit semula"));
+      lcd.setCursor(0, 1); lcd.print(F("dengan semangat!"));
+    }
+  }
+}
+
+void displayStandby(int page) {
+  lcd.clear();
+  if (page == 0) {
+    lcd.setCursor(0, 0); lcd.print(F(" EMOTION SELECT"));
+    lcd.setCursor(0, 1); lcd.print(F("=waiting camera="));
+  } 
+  else if (page == 1) {
+    float h = dht.readHumidity();
+    float t = dht.readTemperature();
+
+    if (isnan(h) || isnan(t)) {
+      lcd.setCursor(0, 0); lcd.print(F("DHT11 Error!"));
+      lcd.setCursor(0, 1); lcd.print(F("Check Wiring"));
+    } else {
+      lcd.setCursor(0, 0);
+      lcd.print(F("Temp : "));
+      lcd.print(t, 1);
+      lcd.print((char)223); // Simbol °
+      lcd.print(F("C"));
+
+      lcd.setCursor(0, 1);
+      lcd.print(F("Humid: "));
+      lcd.print(h, 1);
+      lcd.print(F("%"));
+    }
+  }
+}
